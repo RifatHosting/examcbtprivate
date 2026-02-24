@@ -955,7 +955,7 @@
                 <i class="ph-fill ph-bell-ringing" style="font-size:34px;color:white;"></i>
             </div>
             <h2 style="font-size:22px;font-weight:800;margin-bottom:10px;letter-spacing:-0.3px;">Izinkan Notifikasi</h2>
-            <p style="color:var(--label-secondary);font-size:15px;line-height:1.6;margin-bottom:28px;">Pofus akan memberikan notifikasi pengingat sesi yang akan datang dan saat sesi dimulai.</p>
+            <p style="color:var(--label-secondary);font-size:15px;line-height:1.6;margin-bottom:28px;">Pofus akan mengirimkan pengingat <strong>langsung ke notifikasi HP</strong> kamu — saat sesi akan dimulai, sedang berlangsung, dan selesai. Browser akan meminta izin akses notifikasi.</p>
             <div style="display:flex;flex-direction:column;gap:10px;">
                 <button id="btn-notif-allow" class="btn-primary">Izinkan Notifikasi</button>
                 <button id="btn-notif-skip" class="btn-secondary">Lewati untuk Sekarang</button>
@@ -1466,17 +1466,112 @@ function showBanner(title, body, icon = '🔔', duration = 5000) {
 function dismissBanner() { $('notif-banner').classList.remove('show'); clearTimeout(bannerTimer); }
 
 // ═══════════════════════════════════════════════════════
+//  SERVICE WORKER REGISTRATION
+// ═══════════════════════════════════════════════════════
+const SW_CODE = `
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(clients.claim()));
+self.addEventListener('notificationclick', e => {
+    e.notification.close();
+    e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+        if (list.length > 0) return list[0].focus();
+        return clients.openWindow('/');
+    }));
+});
+self.addEventListener('message', e => {
+    if (e.data && e.data.type === 'SHOW_NOTIFICATION') {
+        const { title, body, tag, icon } = e.data;
+        e.waitUntil(
+            self.registration.showNotification(title, {
+                body,
+                tag,
+                icon: icon || '/favicon.ico',
+                badge: icon || '/favicon.ico',
+                renotify: true,
+                requireInteraction: false,
+                silent: false,
+                vibrate: [200, 100, 200]
+            })
+        );
+    }
+});
+`;
+
+let swRegistration = null;
+
+async function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return null;
+    try {
+        // Inject SW as blob URL so it works from a single HTML file
+        const blob = new Blob([SW_CODE], { type: 'application/javascript' });
+        const swUrl = URL.createObjectURL(blob);
+        
+        // Check if already registered
+        const existing = await navigator.serviceWorker.getRegistration();
+        if (existing) {
+            swRegistration = existing;
+            return existing;
+        }
+        
+        // Try registering with blob (works on some browsers)
+        try {
+            swRegistration = await navigator.serviceWorker.register(swUrl, { scope: '/' });
+            await navigator.serviceWorker.ready;
+            return swRegistration;
+        } catch(blobErr) {
+            // Fallback: try data URI SW (Firefox)
+            const dataUri = 'data:application/javascript;base64,' + btoa(SW_CODE);
+            swRegistration = await navigator.serviceWorker.register(dataUri, { scope: '/' });
+            await navigator.serviceWorker.ready;
+            return swRegistration;
+        }
+    } catch(e) {
+        console.warn('SW registration failed:', e);
+        return null;
+    }
+}
+
+// ═══════════════════════════════════════════════════════
 //  SMART NOTIFICATION ENGINE
 // ═══════════════════════════════════════════════════════
-function sendNotification(title, body, tag) {
-    // Browser Notification
+async function sendNotification(title, body, tag) {
+    // Try Service Worker notification (real HP notification)
     if (Notification.permission === 'granted') {
+        let sent = false;
+        
+        // Method 1: via SW message (best for mobile)
         try {
-            new Notification(title, { body, tag, icon: '', silent: false });
+            const reg = swRegistration || await navigator.serviceWorker.ready;
+            if (reg && reg.active) {
+                reg.active.postMessage({ type: 'SHOW_NOTIFICATION', title, body, tag, icon: '' });
+                sent = true;
+            }
         } catch(e) {}
+        
+        // Method 2: showNotification via registration directly
+        if (!sent) {
+            try {
+                const reg = await navigator.serviceWorker.ready;
+                await reg.showNotification(title, {
+                    body,
+                    tag,
+                    renotify: true,
+                    silent: false,
+                    vibrate: [200, 100, 200]
+                });
+                sent = true;
+            } catch(e) {}
+        }
+        
+        // Method 3: Fallback to basic Notification API
+        if (!sent) {
+            try {
+                new Notification(title, { body, tag, silent: false });
+            } catch(e) {}
+        }
     }
-    // Always show in-app banner
-    const iconMap = { 'upcoming': '⏰', 'started': '🟢', 'ended': '✅' };
+    
+    // Always show in-app banner too
     const catIcon = tag && tag.includes('upcoming') ? '⏰' : tag && tag.includes('ended') ? '✅' : '🟢';
     showBanner(title, body, catIcon, 6000);
 }
@@ -1584,7 +1679,10 @@ function startApp() {
     loadProfileHeader();
     loadNotifSettings();
     switchTab('home');
-    startNotifEngine();
+    // Register SW for real push notifications
+    registerServiceWorker().then(() => {
+        startNotifEngine();
+    });
 }
 
 function loadNotifSettings() {
@@ -1628,10 +1726,19 @@ $('btn-notif-allow').onclick = async () => {
         localStorage.setItem(DB.notif, 'unsupported');
         showToast('Browser tidak mendukung notifikasi', 'warn');
     } else {
+        // Register SW first, then request permission
+        await registerServiceWorker();
         const perm = await Notification.requestPermission();
         localStorage.setItem(DB.notif, perm);
-        if (perm === 'granted') showToast('Notifikasi berhasil diaktifkan! 🔔', 'success');
-        else showToast('Izin notifikasi ditolak', 'warn');
+        if (perm === 'granted') {
+            showToast('Notifikasi berhasil diaktifkan! 🔔', 'success');
+            // Send test notification to confirm it works
+            setTimeout(() => {
+                sendNotification('Pofus Aktif 🔔', 'Kamu akan menerima pengingat jadwal di sini.', 'welcome');
+            }, 1500);
+        } else {
+            showToast('Izin notifikasi ditolak', 'warn');
+        }
     }
     hideNotifPrompt(); startApp();
 };
@@ -2230,9 +2337,15 @@ $('toggle-notif-input').addEventListener('change', async e => {
             showToast('Izin diblokir browser. Ubah di pengaturan browser.', 'warn');
             e.target.checked = false;
         } else if (Notification.permission === 'default') {
+            await registerServiceWorker();
             const perm = await Notification.requestPermission();
             localStorage.setItem(DB.notif, perm);
             e.target.checked = perm === 'granted';
+            if (perm === 'granted') {
+                setTimeout(() => {
+                    sendNotification('Notifikasi Aktif 🔔', 'Pofus akan mengirim pengingat jadwal ke HP kamu.', 'notif-test');
+                }, 1000);
+            }
             showToast(perm === 'granted' ? 'Notifikasi aktif 🔔' : 'Izin ditolak', perm === 'granted' ? 'success' : 'warn');
             renderAccount();
         }
